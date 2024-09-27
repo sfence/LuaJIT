@@ -205,6 +205,9 @@ static void mcode_protect(jit_State *J, int prot)
 
 #ifdef LJ_TARGET_JUMPRANGE
 
+#include <stdio.h>
+#include <inttypes.h>
+
 /* Get memory within relative jump distance of our code in 64 bit mode. */
 static void *mcode_alloc(jit_State *J, size_t sz)
 {
@@ -226,12 +229,14 @@ static void *mcode_alloc(jit_State *J, size_t sz)
   /* Limit probing iterations, depending on the available pool size. */
   for (i = 0; i < LJ_TARGET_JUMPRANGE; i++) {
     if (mcode_validptr(hint)) {
-      void *p = mcode_alloc_at(J, hint, sz, MCPROT_GEN);
-
+      void *p = mcode_alloc_at(J, 0, sz, MCPROT_GEN);
+      if (mcode_validptr(p)) return p;
       if (mcode_validptr(p) &&
-	  ((uintptr_t)p + sz - target < range || target - (uintptr_t)p < range))
-	return p;
+          ((uintptr_t)p + sz - target < range || target - (uintptr_t)p < range))
+        return p;
       if (p) mcode_free(J, p, sz);  /* Free badly placed area. */
+      if (i<2)
+        printf("Failed for try %d hint 0x%"PRIxPTR" siz %zu range %"PRIuPTR" target 0x%"PRIxPTR" with p %p\n", i, hint, sz, range, target, p);
     }
     /* Next try probing 64K-aligned pseudo-random addresses. */
     do {

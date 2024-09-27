@@ -52,22 +52,35 @@ static void asm_exitstub_setup(ASMState *as, ExitNo nexits)
 {
   ExitNo i;
   MCode *mxp = as->mctop;
-  if (mxp - (nexits + 3 + MCLIM_REDZONE) < as->mclim)
-    asm_mclimit(as);
-  /* 1: str lr,[sp]; bl ->vm_exit_handler; movz w0,traceno; bl <1; bl <1; ... */
-  for (i = nexits-1; (int32_t)i >= 0; i--)
-    *--mxp = A64I_LE(A64I_BL | A64F_S26(-3-i));
+  if (mxp - (nexits + 7 + MCLIM_REDZONE) < as->mclim)
+  asm_mclimit(as);
+  /* 1: str lr,[sp]; mov lr <- vm_exit_handler; blr lr; movz w0,traceno; bl <1; bl <1; ... */
+  for (i = nexits-1; (int32_t)i >= 0; i--) {
+    *--mxp = A64I_LE(A64I_BL | A64F_S26(-7-i));
+  }
   *--mxp = A64I_LE(A64I_MOVZw | A64F_U16(as->T->traceno));
-  mxp--;
-  *mxp = A64I_LE(A64I_BL | A64F_S26(((MCode *)(void *)lj_vm_exit_handler-mxp)));
+  /* BL and BLR overwrite LR register with PC+4 value */
+  *--mxp = A64I_LE(A64I_BLR | A64F_N(RID_LR));
+  //printf("lj_vm_exit_handler called here for traceno %i long: %p breakpoint %p\n", as->T->traceno, mxp, mxp-5);
+  uintptr_t target = (uintptr_t)lj_vm_exit_handler;
+  *--mxp = A64I_LE(A64I_MOVKx) | A64F_U16((target >> 48) & 0xffff) | A64F_LSL16(48) | A64F_D(RID_LR);
+  *--mxp = A64I_LE(A64I_MOVKx) | A64F_U16((target >> 32) & 0xffff) | A64F_LSL16(32) | A64F_D(RID_LR);
+  *--mxp = A64I_LE(A64I_MOVKx) | A64F_U16((target >> 16) & 0xffff) | A64F_LSL16(16) | A64F_D(RID_LR);
+  *--mxp = A64I_LE(A64I_MOVKx) | A64F_U16((target >> 0) & 0xffff) | A64F_LSL16(0) | A64F_D(RID_LR);
   *--mxp = A64I_LE(A64I_STRx | A64F_D(RID_LR) | A64F_N(RID_SP));
+  /* This is a space for potencial asm_tail_fixup */
+  *--mxp = 0;
+  *--mxp = 0;
+  *--mxp = 0;
+  *--mxp = 0;
+  *--mxp = 0;
   as->mctop = mxp;
 }
 
 static MCode *asm_exitstub_addr(ASMState *as, ExitNo exitno)
 {
   /* Keep this in-sync with exitstub_trace_addr(). */
-  return as->mctop + exitno + 3;
+  return as->mctop + exitno + 7 + 5;
 }
 
 /* Emit conditional branch to exit for guard. */
@@ -77,6 +90,7 @@ static void asm_guardcc(ASMState *as, A64CC cc)
   MCode *p = as->mcp;
   if (LJ_UNLIKELY(p == as->invmcp)) {
     as->loopinv = 1;
+    lj_assertA(A64F_S_OK(target-p, 26), "branch target out of range");
     *p = A64I_B | A64F_S26(target-p);
     emit_cond_branch(as, cc^1, p-1);
     return;
@@ -93,6 +107,7 @@ static int asm_guardtnb(ASMState *as, A64Ins ai, Reg r, uint32_t bit)
   if (LJ_UNLIKELY(p == as->invmcp)) {
     if (as->orignins > 1023) return 0;  /* Delta might end up too large. */
     as->loopinv = 1;
+    lj_assertA(A64F_S_OK(delta, 26), "branch target out of range");
     *p = A64I_B | A64F_S26(delta);
     ai ^= 0x01000000u;
     target = p-1;
@@ -110,6 +125,7 @@ static void asm_guardcnb(ASMState *as, A64Ins ai, Reg r)
   MCode *p = as->mcp;
   if (LJ_UNLIKELY(p == as->invmcp)) {
     as->loopinv = 1;
+    lj_assertA(A64F_S_OK(target-p, 26), "branch target out of range");
     *p = A64I_B | A64F_S26(target-p);
     emit_cnb(as, ai^0x01000000u, r, p-1);
     return;
@@ -1864,6 +1880,7 @@ static void asm_loop_fixup(ASMState *as)
     p[-2] |= ((uint32_t)delta & mask) << 5;
   } else {
     ptrdiff_t delta = target - (p - 1);
+    lj_assertA(A64F_S_OK(delta, 26), "branch target out of range");
     p[-1] = A64I_B | A64F_S26(delta);
   }
 }
@@ -1932,7 +1949,16 @@ static void asm_tail_fixup(ASMState *as, TraceNo lnk)
   }
   /* Patch exit branch. */
   target = lnk ? traceref(as->J, lnk)->mcode : (MCode *)lj_vm_exit_interp;
-  p[-1] = A64I_B | A64F_S26((target-p)+1);
+  ptrdiff_t delta = (target-p)+1;
+  if (A64F_S_OK(delta, 26)) {
+    p[-1] = A64I_LE(A64I_B | A64F_S26(delta));
+  } else {
+    p[-1] = A64I_LE(A64I_MOVKx | A64F_U16(((uintptr_t)target >> 48) & 0xffff) | A64F_LSL16(48) | A64F_D(RID_X28));
+    p[0] = A64I_LE(A64I_MOVKx | A64F_U16(((uintptr_t)target >> 32) & 0xffff) | A64F_LSL16(32) | A64F_D(RID_X28));
+    p[1] = A64I_LE(A64I_MOVKx | A64F_U16(((uintptr_t)target >> 16) & 0xffff) | A64F_LSL16(16) | A64F_D(RID_X28));
+    p[2] = A64I_LE(A64I_MOVKx | A64F_U16(((uintptr_t)target >> 0) & 0xffff) | A64F_LSL16(0) | A64F_D(RID_X28));
+    p[3] = A64I_LE(A64I_BR | A64F_N(RID_X28));
+  }
 }
 
 /* Prepare tail of code. */
@@ -2032,41 +2058,48 @@ void lj_asm_patchexit(jit_State *J, GCtrace *T, ExitNo exitno, MCode *target)
     ptrdiff_t delta = target - p;
     MCode ins = A64I_LE(*p);
     if ((ins & 0xff000000u) == 0x54000000u &&
-	((ins ^ ((px-p)<<5)) & 0x00ffffe0u) == 0) {
+        ((ins ^ ((px-p)<<5)) & 0x00ffffe0u) == 0) {
       /* Patch bcc, if within range. */
       if (A64F_S_OK(delta, 19)) {
-	*p = A64I_LE((ins & 0xff00001fu) | A64F_S19(delta));
-	if (!cstart) cstart = p;
+        *p = A64I_LE((ins & 0xff00001fu) | A64F_S19(delta));
+        if (!cstart) cstart = p;
       }
     } else if ((ins & 0xfc000000u) == 0x14000000u &&
-	       ((ins ^ (px-p)) & 0x03ffffffu) == 0) {
+         ((ins ^ (px-p)) & 0x03ffffffu) == 0) {
       /* Patch b. */
       lj_assertJ(A64F_S_OK(delta, 26), "branch target out of range");
       *p = A64I_LE((ins & 0xfc000000u) | A64F_S26(delta));
       if (!cstart) cstart = p;
     } else if ((ins & 0x7e000000u) == 0x34000000u &&
-	       ((ins ^ ((px-p)<<5)) & 0x00ffffe0u) == 0) {
+         ((ins ^ ((px-p)<<5)) & 0x00ffffe0u) == 0) {
       /* Patch cbz/cbnz, if within range. */
       if (p[-1] == ARM64_NOPATCH_GC_CHECK) {
-	patchlong = 0;
+        patchlong = 0;
       } else if (A64F_S_OK(delta, 19)) {
-	*p = A64I_LE((ins & 0xff00001fu) | A64F_S19(delta));
-	if (!cstart) cstart = p;
+        *p = A64I_LE((ins & 0xff00001fu) | A64F_S19(delta));
+        if (!cstart) cstart = p;
       }
     } else if ((ins & 0x7e000000u) == 0x36000000u &&
-	       ((ins ^ ((px-p)<<5)) & 0x0007ffe0u) == 0) {
+         ((ins ^ ((px-p)<<5)) & 0x0007ffe0u) == 0) {
       /* Patch tbz/tbnz, if within range. */
       if (A64F_S_OK(delta, 14)) {
-	*p = A64I_LE((ins & 0xfff8001fu) | A64F_S14(delta));
-	if (!cstart) cstart = p;
+        *p = A64I_LE((ins & 0xfff8001fu) | A64F_S14(delta));
+        if (!cstart) cstart = p;
       }
     }
   }
   /* Always patch long-range branch in exit stub itself. Except, if we can't. */
   if (patchlong) {
     ptrdiff_t delta = target - px;
-    lj_assertJ(A64F_S_OK(delta, 26), "branch target out of range");
-    *px = A64I_B | A64F_S26(delta);
+    if (A64F_S_OK(delta, 26)) {
+      *px = A64I_LE(A64I_B | A64F_S26(delta));
+    } else {
+        *px = A64I_LE(A64I_MOVKx | A64F_U16(((uintptr_t)target >> 48) & 0xffff) | A64F_LSL16(48) | A64F_D(RID_LR));
+        *++px = A64I_LE(A64I_MOVKx | A64F_U16(((uintptr_t)target >> 32) & 0xffff) | A64F_LSL16(32) | A64F_D(RID_LR));
+        *++px = A64I_LE(A64I_MOVKx | A64F_U16(((uintptr_t)target >> 16) & 0xffff) | A64F_LSL16(16) | A64F_D(RID_LR));
+        *++px = A64I_LE(A64I_MOVKx | A64F_U16(((uintptr_t)target >> 0) & 0xffff) | A64F_LSL16(0) | A64F_D(RID_LR));
+        *++px = A64I_LE(A64I_BLR | A64F_N(RID_LR));
+    }
     if (!cstart) cstart = px;
   }
   if (cstart) lj_mcode_sync(cstart, px+1);
