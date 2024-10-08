@@ -94,6 +94,10 @@ static int mcode_setprot(void *p, size_t sz, DWORD prot)
 
 #include <sys/mman.h>
 
+#ifdef LJ_TARGET_OSX
+#include <pthread.h>
+#endif
+
 #ifndef MAP_ANONYMOUS
 #define MAP_ANONYMOUS	MAP_ANON
 #endif
@@ -107,11 +111,21 @@ static int mcode_setprot(void *p, size_t sz, DWORD prot)
 #define MCPROT_CREATE	0
 #endif
 
+#include <stdio.h>
+#include <errno.h>
+#include <string.h>
+#include <inttypes.h>
+
 static void *mcode_alloc_at(jit_State *J, uintptr_t hint, size_t sz, int prot)
 {
+#ifdef LJ_TARGET_OSX
+  void *p = mmap((void *)hint, sz, MCPROT_RWX, MAP_PRIVATE|MAP_ANONYMOUS|MAP_JIT, -1, 0);
+#else
   void *p = mmap((void *)hint, sz, prot|MCPROT_CREATE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+#endif
   if (p == MAP_FAILED) {
     if (!hint) lj_trace_err(J, LJ_TRERR_MCODEAL);
+		printf("MMAP FAILED hint 0x%" PRIxPTR " size %zu: %s\n", hint, sz, strerror(errno));
     p = NULL;
   }
   return p;
@@ -125,7 +139,12 @@ static void mcode_free(jit_State *J, void *p, size_t sz)
 
 static int mcode_setprot(void *p, size_t sz, int prot)
 {
+#ifdef LJ_TARGET_OSX
+  pthread_jit_write_protect_np(prot & PROT_EXEC);
+  return 0;
+#else
   return mprotect(p, sz, prot);
+#endif
 }
 
 #else
@@ -216,14 +235,18 @@ static void *mcode_alloc(jit_State *J, size_t sz)
   /* First try a contiguous area below the last one. */
   uintptr_t hint = J->mcarea ? (uintptr_t)J->mcarea - sz : 0;
   int i;
+#ifdef LJ_TARGET_OSX
+  pthread_jit_write_protect_np(0);
+#endif
   /* Limit probing iterations, depending on the available pool size. */
   for (i = 0; i < LJ_TARGET_JUMPRANGE; i++) {
     if (mcode_validptr(hint)) {
       void *p = mcode_alloc_at(J, hint, sz, MCPROT_GEN);
       if (mcode_validptr(p) &&
 	  ((uintptr_t)p + sz - target < range || target - (uintptr_t)p < range))
-	return p;
+       return p;
       if (p) mcode_free(J, p, sz);  /* Free badly placed area. */
+      printf("badly placed %p, %zu for hint 0x%"PRIxPTR" range %"PRIxPTR" target %"PRIxPTR"\n", p, sz, hint, range, target);
     }
     /* Next try probing 64K-aligned pseudo-random addresses. */
     do {
